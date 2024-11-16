@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.7;
+pragma solidity ^0.8.19;
 
-import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import {FunctionsClient} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/FunctionsClient.sol";
+import {ConfirmedOwner} from "@chainlink/contracts/src/v0.8/access/ConfirmedOwner.sol";
+import {FunctionsRequest} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
 
-contract PlantDataConsumer is ChainlinkClient, Ownable {
-    using Chainlink for Chainlink.Request;
+contract PlantyDataConsumer is FunctionsClient, ConfirmedOwner {
+    using FunctionsRequest for FunctionsRequest.Request;
+
+    bytes32 public s_lastRequestId;
+    bytes public s_lastResponse;
+    bytes public s_lastError;
 
     struct PlantData {
         uint256 humidity;
@@ -17,67 +22,59 @@ contract PlantDataConsumer is ChainlinkClient, Ownable {
 
     PlantData public plantData;
 
-    address private oracle;
-    uint256 private fee;
-    bytes32 private jobId;
+    uint32 constant CALLBACK_GAS_LIMIT = 300000;
+    address private constant ROUTER = 0xb83E47C2bC239B3bf370bc41e1459A34b41238D0;
+    bytes32 private constant DON_ID =
+        0x66756e2d657468657265756d2d7365706f6c69612d3100000000000000000000;
 
-    event DataFetched(
-        uint256 humidity,
-        uint256 wateringInterval,
-        uint256 temperature,
-        string timestamp,
-        string plantType
+    string constant source = string(
+        abi.encodePacked(
+            "const apiResponse = await Functions.makeHttpRequest({",
+            "  url: 'https://planty-server.onrender.com/plant-data'",
+            "});",
+            "if (!apiResponse || apiResponse.error) {",
+            "  throw new Error('Request failed');",
+            "}",
+            "const data = apiResponse.data;",
+            "return Functions.encodeABI(",
+            "  ['uint256', 'uint256', 'uint256', 'string', 'string'],",
+            "  [data.humidity, data.wateringInterval, data.temperature, data.timestamp, data.plantType]",
+            ");"
+        )
     );
 
-    event RequestSent(bytes32 requestId);
+    event RequestSent(bytes32 indexed requestId);
+    event ResponseReceived(bytes32 indexed requestId, bytes response, bytes err);
 
-    constructor(address _oracle, bytes32 _jobId, uint256 _fee, address _link) {
-        setChainlinkToken(_link);
-        oracle = _oracle;
-        jobId = _jobId;
-        fee = _fee; // 예: 0.1 LINK
-    }
+    constructor() FunctionsClient(ROUTER) ConfirmedOwner(msg.sender) {}
 
-    function fetchPlantData() public onlyOwner returns (bytes32 requestId) {
-        Chainlink.Request memory req = buildChainlinkRequest(jobId, address(this), this.fulfill.selector);
-
-        // 요청할 API URL
-        req.add("get", "https://planty-server.onrender.com/plant-data");
-
-        // JSON 응답에서 필요한 데이터의 경로를 지정
-        req.add("path_humidity", "humidity");
-        req.add("path_wateringInterval", "wateringInterval");
-        req.add("path_temperature", "temperature");
-        req.add("path_timestamp", "timestamp");
-        req.add("path_plantType", "plantType");
-
-        // Chainlink 오라클에 요청
-        requestId = sendChainlinkRequestTo(oracle, req, fee);
+    function requestPlantData(uint64 subscriptionId) external onlyOwner returns (bytes32 requestId) {
+        FunctionsRequest.Request memory req;
+        req.initializeRequestForInlineJavaScript(source);
+        requestId = _sendRequest(req.encodeCBOR(), subscriptionId, CALLBACK_GAS_LIMIT, DON_ID);
+        s_lastRequestId = requestId;
         emit RequestSent(requestId);
-        return requestId;
     }
 
-    // Chainlink 노드에서 응답을 받는 함수
-    function fulfill(
-        bytes32 _requestId,
-        uint256 _humidity,
-        uint256 _wateringInterval,
-        uint256 _temperature,
-        string memory _timestamp,
-        string memory _plantType
-    ) public recordChainlinkFulfillment(_requestId) {
-        plantData = PlantData(_humidity, _wateringInterval, _temperature, _timestamp, _plantType);
+    function fulfillRequest(
+        bytes32 requestId,
+        bytes memory response,
+        bytes memory err
+    ) internal override {
+        if (err.length > 0) {
+            s_lastError = err;
+        } else {
+            (
+                uint256 humidity,
+                uint256 wateringInterval,
+                uint256 temperature,
+                string memory timestamp,
+                string memory plantType
+            ) = abi.decode(response, (uint256, uint256, uint256, string, string));
 
-        emit DataFetched(_humidity, _wateringInterval, _temperature, _timestamp, _plantType);
-    }
-
-    // LINK 잔액 조회
-    function getLinkBalance() public view returns (uint256) {
-        return LinkTokenInterface(chainlinkTokenAddress()).balanceOf(address(this));
-    }
-
-    // LINK 토큰 전송 (컨트랙트 소유자만 실행 가능)
-    function transferLink(address recipient, uint256 amount) public onlyOwner {
-        require(LinkTokenInterface(chainlinkTokenAddress()).transfer(recipient, amount), "Unable to transfer");
+            plantData = PlantData(humidity, wateringInterval, temperature, timestamp, plantType);
+            s_lastResponse = response;
+        }
+        emit ResponseReceived(requestId, response, err);
     }
 }
